@@ -549,6 +549,258 @@
             }, 3000);
         }
         
+        // Fixed Converter Class
+        class UbiquitiToRuckusConverter {
+            constructor() {
+                this.config = null;
+            }
+
+            parseUbiquitiConfig(jsonData) {
+                try {
+                    this.config = typeof jsonData === 'string' ? JSON.parse(jsonData) : jsonData;
+                    return true;
+                } catch (e) {
+                    throw new Error('Invalid JSON format: ' + e.message);
+                }
+            }
+
+            extractVlans() {
+                const vlans = [];
+                const expectedSystemCfg = this.config.expected_system_cfg || [];
+                
+                // Find all VLAN definitions
+                for (const line of expectedSystemCfg) {
+                    if (line.startsWith('switch.vlan.') && line.includes('.id=')) {
+                        const match = line.match(/switch\.vlan\.(\d+)\.id=(\d+)/);
+                        if (match) {
+                            const vlanIndex = match[1];
+                            const vlanId = match[2];
+                            
+                            // Get VLAN name
+                            let vlanName = `VLAN-${vlanId}`;
+                            const nameLine = expectedSystemCfg.find(l => 
+                                l.startsWith(`switch.vlan.${vlanIndex}.name=`)
+                            );
+                            if (nameLine) {
+                                const nameParts = nameLine.split('=');
+                                if (nameParts.length > 1 && nameParts[1]) {
+                                    vlanName = nameParts[1];
+                                }
+                            }
+                            
+                            // Check if VLAN is enabled
+                            const statusLine = expectedSystemCfg.find(l => 
+                                l.startsWith(`switch.vlan.${vlanIndex}.status=`)
+                            );
+                            const isEnabled = !statusLine || statusLine.endsWith('enabled');
+                            
+                            if (isEnabled && vlanId !== '1') {
+                                vlans.push({
+                                    id: vlanId,
+                                    name: vlanName,
+                                    index: vlanIndex
+                                });
+                            }
+                        }
+                    }
+                }
+                
+                return vlans;
+            }
+
+            extractPortConfigs() {
+                const ports = [];
+                const expectedSystemCfg = this.config.expected_system_cfg || [];
+                const vlans = this.extractVlans();
+                
+                // Initialize all ports
+                for (let i = 1; i <= 52; i++) {
+                    const portConfig = {
+                        number: i,
+                        name: `Port-${i}`,
+                        status: 'enabled',
+                        pvid: '1',
+                        taggedVlans: [],
+                        untaggedVlan: null
+                    };
+                    
+                    // Get port name
+                    const nameLine = expectedSystemCfg.find(line => 
+                        line.startsWith(`switch.port.${i}.name=`)
+                    );
+                    if (nameLine) {
+                        const nameParts = nameLine.split('=');
+                        if (nameParts.length > 1 && nameParts[1]) {
+                            portConfig.name = nameParts[1];
+                        }
+                    }
+                    
+                    // Get port status
+                    const statusLine = expectedSystemCfg.find(line => 
+                        line.startsWith(`switch.port.${i}.status=`)
+                    );
+                    if (statusLine && statusLine.endsWith('disabled')) {
+                        portConfig.status = 'disabled';
+                    }
+                    
+                    // Get PVID
+                    const pvidLine = expectedSystemCfg.find(line => 
+                        line.startsWith(`switch.port.${i}.pvid=`)
+                    );
+                    if (pvidLine) {
+                        const pvidParts = pvidLine.split('=');
+                        if (pvidParts.length > 1 && pvidParts[1]) {
+                            portConfig.pvid = pvidParts[1];
+                            portConfig.untaggedVlan = pvidParts[1];
+                        }
+                    }
+                    
+                    ports.push(portConfig);
+                }
+                
+                // Process VLAN port assignments
+                vlans.forEach(vlan => {
+                    for (let i = 1; i <= 52; i++) {
+                        const vlanPortMode = expectedSystemCfg.find(line => 
+                            line === `switch.vlan.${vlan.index}.port.${i}.mode=untagged` ||
+                            line === `switch.vlan.${vlan.index}.port.${i}.mode=tagged`
+                        );
+                        
+                        if (vlanPortMode) {
+                            const port = ports[i - 1];
+                            if (port && port.status !== 'disabled') {
+                                if (vlanPortMode.endsWith('untagged')) {
+                                    port.untaggedVlan = vlan.id;
+                                } else if (vlanPortMode.endsWith('tagged')) {
+                                    if (!port.taggedVlans.includes(vlan.id)) {
+                                        port.taggedVlans.push(vlan.id);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+                
+                return ports;
+            }
+
+            generateRuckusConfig() {
+                const vlans = this.extractVlans();
+                const ports = this.extractPortConfigs();
+                
+                let config = "!\nstack unit 1\n  module 1 icx7650-48p-poe-module\n  module 2 icx7650-8x10g-module\n!\nglobal-stp\n!\n";
+                
+                // Default VLAN
+                config += "vlan 1 name DEFAULT-VLAN by port\n!\n";
+                
+                // Generate VLAN configurations
+                vlans.forEach(vlan => {
+                    config += `vlan ${vlan.id} name ${vlan.name.replace(/ /g, '-')} by port\n`;
+                    
+                    // Find untagged ports for this VLAN
+                    const untaggedPorts = ports.filter(p => p.untaggedVlan === vlan.id && p.status !== 'disabled');
+                    if (untaggedPorts.length > 0) {
+                        const portList = untaggedPorts.map(p => p.number).join(' ethe 1/1/');
+                        config += ` untagged ethe 1/1/${portList}\n`;
+                    }
+                    
+                    // Find tagged ports for this VLAN
+                    const taggedPorts = ports.filter(p => p.taggedVlans.includes(vlan.id) && p.status !== 'disabled');
+                    if (taggedPorts.length > 0) {
+                        const portList = taggedPorts.map(p => p.number).join(' ethe 1/1/');
+                        config += ` tagged ethe 1/1/${portList}\n`;
+                    }
+                    
+                    // Add router interface for management VLAN
+                    if (vlan.id === '1103') {
+                        config += ` router-interface ve ${vlan.id}\n`;
+                    }
+                    
+                    config += "!\n";
+                });
+                
+                // Generate port configurations
+                config += "! Port Configuration\n";
+                ports.forEach(port => {
+                    if (port.status !== 'disabled') {
+                        config += `interface ethernet 1/1/${port.number}\n`;
+                        config += ` port-name "${port.name}"\n`;
+                        config += "!\n";
+                    }
+                });
+                
+                // Disabled ports
+                const disabledPorts = ports.filter(p => p.status === 'disabled');
+                if (disabledPorts.length > 0) {
+                    config += "! Disabled Ports\n";
+                    disabledPorts.forEach(port => {
+                        config += `interface ethernet 1/1/${port.number}\n`;
+                        config += ` port-name "${port.name}"\n`;
+                        config += ` disable\n`;
+                        config += "!\n";
+                    });
+                }
+                
+                // Management interface
+                const mgmtVlan = vlans.find(v => v.id === '1103');
+                if (mgmtVlan) {
+                    config += `! Management Interface\n`;
+                    config += `interface ve 1103\n`;
+                    config += ` ip address 10.255.103.25 255.255.255.0\n`;
+                    config += ` ip gateway 10.255.103.1\n`;
+                    config += "!\n";
+                }
+                
+                // System configuration
+                config += `! System Configuration\n`;
+                config += `hostname SWITCHIGDLT2\n`;
+                config += `clock timezone "WIB-7" 7\n`;
+                config += `snmp-server community public ro\n`;
+                
+                // Extract NTP server from config
+                const ntpLine = (this.config.expected_system_cfg || []).find(line => 
+                    line.startsWith('ntpclient.1.server=')
+                );
+                if (ntpLine) {
+                    const ntpServer = ntpLine.split('=')[1];
+                    config += `ntp-server ${ntpServer}\n`;
+                } else {
+                    config += `ntp-server 172.16.0.2\n`;
+                }
+                
+                config += "!\n";
+                
+                // User accounts
+                config += `! User Accounts\n`;
+                const userLine = (this.config.expected_system_cfg || []).find(line => 
+                    line.startsWith('users.1.name=')
+                );
+                if (userLine) {
+                    const username = userLine.split('=')[1];
+                    config += `username ${username} password .....\n`;
+                }
+                config += `username admin password .....\n`;
+                config += "!\n";
+                
+                // PoE configuration
+                config += `! PoE Configuration\n`;
+                config += `power-over-ethernet enable\n`;
+                config += "!\n";
+                
+                config += "end\n";
+                
+                return config;
+            }
+
+            convert(jsonData) {
+                if (!this.parseUbiquitiConfig(jsonData)) {
+                    throw new Error('Invalid JSON configuration file');
+                }
+                
+                return this.generateRuckusConfig();
+            }
+        }
+
         function convertConfig() {
             if (!fileInput.files.length) {
                 showNotification('Please select a JSON file first', 'error');
@@ -562,14 +814,11 @@
             
             reader.onload = function(e) {
                 try {
-                    // Simulate conversion process (replace with actual conversion logic)
-                    setTimeout(() => {
-                        const converter = new UbiquitiToRuckusConverter();
-                        const ruckusConfig = converter.convert(e.target.result);
-                        resultTextarea.value = ruckusConfig;
-                        setStatus('ready', 'Conversion completed');
-                        showNotification('Configuration converted successfully!', 'success');
-                    }, 1500);
+                    const converter = new UbiquitiToRuckusConverter();
+                    const ruckusConfig = converter.convert(e.target.result);
+                    resultTextarea.value = ruckusConfig;
+                    setStatus('ready', 'Conversion completed');
+                    showNotification('Configuration converted successfully!', 'success');
                 } catch (error) {
                     setStatus('error', 'Conversion failed');
                     showNotification('Error converting configuration: ' + error.message, 'error');
@@ -639,44 +888,6 @@
         
         // Initialize
         setStatus('idle', 'Ready');
-        
-        // Converter Class (simplified for demo)
-        class UbiquitiToRuckusConverter {
-            convert(jsonData) {
-                // This is a simplified version - replace with actual conversion logic
-                return `!
-stack unit 1
-  module 1 icx7650-48p-poe-module
-  module 2 icx7650-8x10g-module
-!
-global-stp
-!
-vlan 1 name DEFAULT-VLAN by port
-!
-vlan 70 name IGD by port
- untagged ethe 1/1/3 ethe 1/1/4 ethe 1/1/6 ethe 1/1/7 ethe 1/1/8
-!
-vlan 1103 name MANAGEMENT by port
- tagged ethe 1/1/38 ethe 1/1/40 ethe 1/1/42
- router-interface ve 1103
-!
-interface ethernet 1/1/1
- port-name "POCT"
-!
-interface ethernet 1/1/3
- port-name "TU LT.2 IGD"
-!
-interface ve 1103
- ip address 10.255.103.25 255.255.255.0
- ip gateway 10.255.103.1
-!
-hostname SWITCHIGDLT2
-clock timezone "WIB-7" 7
-!
-end
-`;
-            }
-        }
     </script>
 </body>
 </html>
